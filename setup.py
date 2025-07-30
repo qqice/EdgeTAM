@@ -61,6 +61,11 @@ EXTRA_PACKAGES = {
         "timm==1.0.15",
         "eva-decord==0.6.1",
     ],
+    "coreml": [
+        "coremltools>=8.0.0",
+        "pillow>=9.4.0",
+        "timm==1.0.15",  # Required for EdgeTAM model with RepViT backbone
+    ],
 }
 
 # By default, we also build the SAM 2 CUDA extension.

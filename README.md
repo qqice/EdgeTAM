@@ -49,6 +49,12 @@ To use the EdgeTAM predictor and run the example notebooks, `jupyter` and `matpl
 pip install -e ".[notebooks]"
 ```
 
+For CoreML export to deploy EdgeTAM on iOS/macOS devices, install the CoreML dependencies:
+
+```bash
+pip install -e ".[coreml]"
+```
+
 Note:
 1. It's recommended to create a new Python environment via [Anaconda](https://www.anaconda.com/) for this installation and install PyTorch 2.3.1 (or higher) via `pip` following https://pytorch.org/. If you have a PyTorch version lower than 2.3.1 in your current environment, the installation command above will try to upgrade it to the latest PyTorch version using `pip`.
 2. The step above requires compiling a custom CUDA kernel with the `nvcc` compiler. If it isn't already available on your machine, please install the [CUDA toolkits](https://developer.nvidia.com/cuda-toolkit-archive) with a version that matches your PyTorch CUDA version.
@@ -124,6 +130,25 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
 ```
 
 Please refer to the examples in [video_predictor_example.ipynb](./notebooks/video_predictor_example.ipynb) for details on how to add click or box prompts, make refinements, and track multiple objects in videos.
+
+### CoreML export for iOS/macOS deployment
+
+EdgeTAM can be exported to CoreML format for deployment on iOS and macOS devices, enabling on-device inference with hardware acceleration.
+
+```bash
+# Export EdgeTAM to CoreML format
+python ./tools/export_to_coreml.py \
+  --sam2_cfg configs/edgetam.yaml \
+  --sam2_checkpoint ./checkpoints/edgetam.pt \
+  --output_dir ./coreml_models \
+  --validate
+```
+
+This creates three optimized CoreML models:
+- **Image Encoder**: Processes input images to feature embeddings (~9.6MB)
+- **Prompt Encoder**: Handles user prompts (points, boxes, masks) (~2MB) 
+- **Mask Decoder**: Generates segmentation masks from features (~8MB)
+
 
 ## Performance
 ### Promptable Video Segmentation (PVS)
