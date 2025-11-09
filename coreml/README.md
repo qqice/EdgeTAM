@@ -31,7 +31,24 @@ image = Image.open("image.jpg").resize((1024, 1024))
 encoder_out = image_encoder.predict({"image": image})
 
 # Add your point and generate mask
-# See coreml_models/inference_example.py for complete example
+# See inference_example.py for complete video tracking example
+```
+
+## Video Tracking Example
+
+The included `inference_example.py` demonstrates real-time video tracking:
+
+```bash
+# Demo with default coffee video
+python coreml/inference_example.py
+
+# Use your own video
+python coreml/inference_example.py --video path/to/your/video.mp4
+
+# Run different examples
+python coreml/inference_example.py --example segment  # Single image
+python coreml/inference_example.py --example track   # Real-time tracking
+python coreml/inference_example.py --example demo    # Video demo (default)
 ```
 
 ## Performance Benchmark
