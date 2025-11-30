@@ -84,9 +84,15 @@ def main():
     input_label = [1]
     
     # 3. 运行PyTorch模型
+    # 支持的模型类型:
+    # - SAM2.1: sam2.1_hiera_tiny, sam2.1_hiera_small, sam2.1_hiera_base_plus, sam2.1_hiera_large
+    # - EdgeTAM: edgetam
     print("Running PyTorch model...")
-    checkpoint = "sam2.1_hiera_large.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    # 选择模型配置 (可修改为其他模型)
+    # checkpoint = "sam2.1_hiera_large.pt"
+    # model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    checkpoint = "../checkpoints/edgetam.pt"  # EdgeTAM 检查点路径
+    model_cfg = "configs/edgetam.yaml"  # EdgeTAM 配置
     predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
     
     with torch.inference_mode():
@@ -99,8 +105,10 @@ def main():
     
     # 4. 运行ONNX模型
     print("Running ONNX model...")
-    encoder_path = "sam2.1_hiera_tiny_encoder.s.onnx"
-    decoder_path = "sam2.1_hiera_tiny_decoder.onnx"
+    # ONNX 模型路径 (需要先通过 export_onnx.py 生成)
+    # 对于 EdgeTAM: python export_onnx.py --model_type edgetam --checkpoint ../checkpoints/edgetam.pt --output_encoder edgetam_encoder.onnx --output_decoder edgetam_decoder.onnx
+    encoder_path = "edgetam_encoder.onnx"
+    decoder_path = "edgetam_decoder.onnx"
     
     # 创建ONNX Runtime会话
     encoder_session = onnxruntime.InferenceSession(encoder_path)

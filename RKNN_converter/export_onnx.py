@@ -199,6 +199,8 @@ if __name__ == "__main__":
         model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
     elif model_type == "sam2.1_hiera_large":
         model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    elif model_type == "edgetam":
+        model_cfg = "configs/edgetam.yaml"
     else:
         model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 

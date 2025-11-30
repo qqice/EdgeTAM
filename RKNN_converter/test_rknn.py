@@ -69,8 +69,12 @@ def main():
     # 1. 加载原始图片
     path = "dog.jpg"
     orig_image, input_image, (scale, offset_x, offset_y) = load_image(path)
-    decoder_path = "sam2.1_hiera_small_decoder.onnx"
-    encoder_path = "sam2.1_hiera_small_encoder.rknn"
+    # RKNN 和 ONNX 模型路径
+    # 对于 EdgeTAM: 先运行 export_onnx.py 生成 ONNX，再运行 convert_rknn.py 转换为 RKNN
+    # python export_onnx.py --model_type edgetam --checkpoint ../checkpoints/edgetam.pt --output_encoder edgetam_encoder.onnx --output_decoder edgetam_decoder.onnx
+    # python convert_rknn.py edgetam
+    decoder_path = "edgetam_decoder.onnx"
+    encoder_path = "edgetam_encoder.rknn"
 
     # 2. 准备输入点
     # input_point_orig = [[750, 400]]

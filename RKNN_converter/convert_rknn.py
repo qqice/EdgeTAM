@@ -11,6 +11,12 @@ import onnxslim
 num_pointss = [1]
 num_labelss = [1]
 
+# 注意: SAM2.1 和 EdgeTAM 的 decoder 输入形状是相同的，因为:
+# - 两者都使用 image_size=1024, backbone_stride=16
+# - FpnNeck 将所有 backbone 通道统一转换为 d_model=256
+# - conv_s0 输出 32 通道 (256x256), conv_s1 输出 64 通道 (128x128)
+# - image_embed 是 256 通道 (64x64)
+
 def convert_to_rknn(onnx_model, model_part, dataset="/home/zt/rk3588-nn/rknn_model_zoo/datasets/COCO/coco_subset_20.txt", quantize=False):
     """转换单个ONNX模型到RKNN格式"""
     rknn_model = onnx_model.replace(".onnx",".rknn")
