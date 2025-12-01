@@ -9,3 +9,7 @@ _C.*
 outputs/*
 coreml_models/*
 checkpoints/*.pt
+.idea/
+RKNN_converter/*.onnx
+RKNN_converter/*.rknn
+RKNN_converter/*.png
