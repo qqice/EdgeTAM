@@ -65,6 +65,11 @@ EXTRA_PACKAGES = {
         "coremltools>=8.0.0",
         "pillow>=9.4.0",
     ],
+    "RKNN":[
+        "onnxslim", 
+        "onnxruntime", 
+        "rknn-toolkit2", 
+    ],
 }
 
 # By default, we also build the SAM 2 CUDA extension.
