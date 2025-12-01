@@ -13,44 +13,33 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
 def load_image(url):
-    """加载并预处理图片"""
+    """加载并预处理图片 - 与 SAM2ImagePredictor 保持一致"""
     response = requests.get(url)
     image = Image.open(BytesIO(response.content)).convert("RGB")
     print(f"Original image size: {image.size}")
+    orig_w, orig_h = image.size
     
-    # 计算resize后的尺寸,保持长宽比
+    # SAM2ImagePredictor 使用 torchvision.transforms.Resize 直接 resize 到 1024x1024
+    # 不保持长宽比！
     target_size = (1024, 1024)
-    w, h = image.size
-    scale = min(target_size[0] / w, target_size[1] / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    print(f"Scale factor: {scale}")
-    print(f"Resized dimensions: {new_w}x{new_h}")
+    resized_image = image.resize(target_size, Image.Resampling.BILINEAR)
     
-    # resize图片
-    resized_image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    # 转换为 numpy 数组
+    img_np = np.array(resized_image).astype(np.float32) / 255.0
     
-    # 创建1024x1024的黑色背景
-    processed_image = Image.new("RGB", target_size, (0, 0, 0))
-    # 将resized图片粘贴到中心位置
-    paste_x = (target_size[0] - new_w) // 2
-    paste_y = (target_size[1] - new_h) // 2
-    print(f"Paste position: ({paste_x}, {paste_y})")
-    processed_image.paste(resized_image, (paste_x, paste_y))
+    # 使用与 SAM2Transforms 相同的 ImageNet 标准化
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_np = (img_np - mean) / std
     
-    # 保存处理后的图片用于检查
-    processed_image.save("debug_processed_image.png")
-    
-    # 转换为numpy数组并归一化到[0,1]
-    img_np = np.array(processed_image).astype(np.float32) / 255.0
-    # 调整维度顺序从HWC到CHW
+    # 调整维度顺序从 HWC 到 CHW
     img_np = img_np.transpose(2, 0, 1)
-    # 添加batch维度
+    # 添加 batch 维度
     img_np = np.expand_dims(img_np, axis=0)
     
     print(f"Final input tensor shape: {img_np.shape}")
     
-    return image, img_np, (scale, paste_x, paste_y)
+    return image, img_np, (orig_w, orig_h)
 
 def prepare_point_input(point_coords, point_labels, image_size=(1024, 1024)):
     """准备点击输入数据"""
@@ -64,23 +53,90 @@ def prepare_point_input(point_coords, point_labels, image_size=(1024, 1024)):
     # 准备mask输入
     mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
     has_mask_input = np.zeros(1, dtype=np.float32)
-    orig_im_size = np.array(image_size, dtype=np.int32)
     
-    return point_coords, point_labels, mask_input, has_mask_input, orig_im_size
+    return point_coords, point_labels, mask_input, has_mask_input
+
+
+def get_stability_scores(mask_logits, threshold=0.0, stability_delta=1.0):
+    """
+    计算 mask 的稳定性分数。
+    稳定性分数 = IoU(高阈值二值化mask, 低阈值二值化mask)
+    """
+    high_thresh_mask = mask_logits > (threshold + stability_delta)
+    low_thresh_mask = mask_logits > (threshold - stability_delta)
+    
+    # 计算交集和并集
+    intersections = np.sum(high_thresh_mask & low_thresh_mask, axis=(-2, -1))
+    unions = np.sum(high_thresh_mask | low_thresh_mask, axis=(-2, -1))
+    
+    # 避免除以零
+    stability_scores = np.where(unions > 0, intersections / unions, 1.0)
+    return stability_scores
+
+
+def select_mask_by_stability(all_masks, all_iou_scores, multimask_output=False, stability_thresh=0.95):
+    """
+    根据稳定性选择 mask，复现 _dynamic_multimask_via_stability 的逻辑。
+    
+    Args:
+        all_masks: 所有 4 个 mask 输出 [batch, 4, H, W]
+        all_iou_scores: 所有 4 个 IoU 分数 [batch, 4]
+        multimask_output: 是否返回多个 mask
+        stability_thresh: 稳定性阈值
+    
+    Returns:
+        选择后的 masks 和 iou_scores
+    """
+    if multimask_output:
+        # 多 mask 输出模式：返回 mask 1-3（跳过 mask 0）
+        return all_masks[:, 1:, :, :], all_iou_scores[:, 1:]
+    
+    # 单 mask 输出模式：根据稳定性动态选择
+    batch_size = all_masks.shape[0]
+    
+    # 从多 mask 输出 (1-3) 中选择 IoU 最高的
+    multimask_logits = all_masks[:, 1:, :, :]  # [batch, 3, H, W]
+    multimask_iou_scores = all_iou_scores[:, 1:]  # [batch, 3]
+    best_indices = np.argmax(multimask_iou_scores, axis=-1)  # [batch]
+    
+    # 获取最佳多 mask
+    best_multimask_logits = np.array([
+        multimask_logits[b, best_indices[b]] for b in range(batch_size)
+    ])[:, np.newaxis, :, :]  # [batch, 1, H, W]
+    best_multimask_iou_scores = np.array([
+        multimask_iou_scores[b, best_indices[b]] for b in range(batch_size)
+    ])[:, np.newaxis]  # [batch, 1]
+    
+    # 单 mask 输出 (mask 0) 及其稳定性分数
+    singlemask_logits = all_masks[:, 0:1, :, :]
+    singlemask_iou_scores = all_iou_scores[:, 0:1]
+    stability_scores = get_stability_scores(singlemask_logits)
+    
+    # 根据稳定性选择
+    is_stable = stability_scores >= stability_thresh
+    
+    # 选择结果
+    mask_out = np.where(
+        is_stable[..., np.newaxis, np.newaxis],
+        singlemask_logits,
+        best_multimask_logits
+    )
+    iou_out = np.where(
+        is_stable,
+        singlemask_iou_scores,
+        best_multimask_iou_scores
+    )
+    
+    return mask_out, iou_out
 
 def main():
     # 1. 加载原始图片
     url = "https://raw.githubusercontent.com/facebookresearch/segment-anything/main/notebooks/images/dog.jpg"
-    orig_image, input_image, (scale, offset_x, offset_y) = load_image(url)
+    orig_image, input_image, (orig_w, orig_h) = load_image(url)
     
-    # 2. 准备输入点 - 需要根据scale和offset调整点击坐标
+    # 2. 准备输入点
+    # 使用原始图像坐标，后面会转换为模型坐标
     input_point_orig = [[750, 400]]
-    input_point = [[
-        int(x * scale + offset_x), 
-        int(y * scale + offset_y)
-    ] for x, y in input_point_orig]
-    print(f"Original point: {input_point_orig}")
-    print(f"Transformed point: {input_point}")
     input_label = [1]
     
     # 3. 运行PyTorch模型
@@ -98,7 +154,7 @@ def main():
     with torch.inference_mode():
         predictor.set_image(orig_image)
         masks_pt, iou_scores_pt, low_res_masks_pt = predictor.predict(
-            point_coords=np.array(input_point),
+            point_coords=np.array(input_point_orig),
             point_labels=np.array(input_label),
             multimask_output=True
         )
@@ -118,9 +174,18 @@ def main():
     encoder_inputs = {'image': input_image}
     high_res_feats_0, high_res_feats_1, image_embed = encoder_session.run(None, encoder_inputs)
     
+    # 将原始图像坐标转换为模型坐标（与 SAM2Transforms.transform_coords 一致）
+    # 公式: coord_model = coord_orig / orig_size * 1024
+    input_point_model = [[
+        x / orig_w * 1024,
+        y / orig_h * 1024
+    ] for x, y in input_point_orig]
+    print(f"Original point: {input_point_orig}")
+    print(f"Model point (1024x1024): {input_point_model}")
+    
     # 准备decoder输入
-    point_coords, point_labels, mask_input, has_mask_input, orig_im_size = prepare_point_input(
-        input_point, input_label, orig_image.size[::-1]
+    point_coords, point_labels, mask_input, has_mask_input = prepare_point_input(
+        input_point_model, input_label, (orig_h, orig_w)
     )
     
     # 运行decoder
@@ -130,40 +195,33 @@ def main():
         'high_res_feats_1': high_res_feats_1,
         'point_coords': point_coords,
         'point_labels': point_labels,
-        # 'orig_im_size': orig_im_size,
         'mask_input': mask_input,
         'has_mask_input': has_mask_input,
     }
     
     low_res_masks, iou_predictions = decoder_session.run(None, decoder_inputs)
     
+    # 根据稳定性选择 mask（复现原始 PyTorch 模型的行为）
+    # 对于单 mask 输出 (multimask_output=False)，这会根据稳定性动态选择
+    # 对于多 mask 输出 (multimask_output=True)，这会返回 mask 1-3
+    selected_masks, selected_iou = select_mask_by_stability(
+        low_res_masks, iou_predictions, multimask_output=True
+    )
+    
     # 后处理: 将low_res_masks缩放到原始图片尺寸
     w, h = orig_image.size
     
-    # 1. 首先将mask缩放到1024x1024
-    masks_1024 = torch.nn.functional.interpolate(
-        torch.from_numpy(low_res_masks),
-        size=(1024, 1024),
-        mode="bilinear",
-        align_corners=False
-    )
-    
-    # 2. 去除padding
-    new_h = int(h * scale)
-    new_w = int(w * scale)
-    start_h = (1024 - new_h) // 2
-    start_w = (1024 - new_w) // 2
-    masks_no_pad = masks_1024[..., start_h:start_h+new_h, start_w:start_w+new_w]
-    
-    # 3. 缩放到原始图片尺寸
+    # 由于 SAM2ImagePredictor 使用直接 resize（不保持长宽比），
+    # 输出的 mask 也是 1024x1024，可以直接 resize 回原始尺寸
+    # 先将 256x256 的 low_res_mask 缩放到原始图片尺寸
     masks_onnx = torch.nn.functional.interpolate(
-        masks_no_pad,
+        torch.from_numpy(selected_masks),
         size=(h, w),
         mode="bilinear",
         align_corners=False
     )
     
-    # 4. 二值化
+    # 二值化
     masks_onnx = masks_onnx > 0.0
     masks_onnx = masks_onnx.numpy()
     
@@ -197,7 +255,8 @@ def main():
     # 6. 打印一些统计信息
     print("\nStatistics:")
     print(f"PyTorch IoU scores: {iou_scores_pt}")
-    print(f"ONNX IoU predictions: {iou_predictions}")
+    print(f"ONNX IoU predictions (selected): {selected_iou}")
+    print(f"ONNX IoU predictions (all 4): {iou_predictions}")
 
 if __name__ == "__main__":
     main() 

@@ -1,3 +1,15 @@
+import sys
+import os
+
+# 获取当前文件 (a.py) 的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 获取父目录 (project/) 的路径
+parent_dir = os.path.dirname(current_dir)
+
+# 将父目录加入到 sys.path 中
+sys.path.append(parent_dir)
+
 from typing import Any
 import argparse
 import pathlib
@@ -46,13 +58,12 @@ class SAM2ImageEncoder(nn.Module):
 
 
 class SAM2ImageDecoder(nn.Module):
-    def __init__(self, sam_model: SAM2Base, multimask_output: bool) -> None:
+    def __init__(self, sam_model: SAM2Base) -> None:
         super().__init__()
         self.mask_decoder = sam_model.sam_mask_decoder
         self.prompt_encoder = sam_model.sam_prompt_encoder
         self.model = sam_model
         self.img_size = sam_model.image_size
-        self.multimask_output = multimask_output
 
     @torch.no_grad()
     def forward(
@@ -62,7 +73,6 @@ class SAM2ImageDecoder(nn.Module):
         high_res_feats_1: torch.Tensor,
         point_coords: torch.Tensor,
         point_labels: torch.Tensor,
-        orig_im_size: torch.Tensor,
         mask_input: torch.Tensor,
         has_mask_input: torch.Tensor,
     ):
@@ -82,16 +92,11 @@ class SAM2ImageDecoder(nn.Module):
             high_res_features=high_res_feats,
         )
 
-        if self.multimask_output:
-            masks = masks[:, 1:, :, :]
-            iou_predictions = iou_predictions[:, 1:]
-        else:
-            masks, iou_predictions = (
-                self.mask_decoder._dynamic_multimask_via_stability(
-                    masks, iou_predictions
-                )
-            )
-
+        # 返回所有 4 个 mask 输出（不跳过第一个）
+        # mask[0]: 单 mask token 输出，用于稳定性判断
+        # mask[1:4]: 多 mask token 输出，用于 IoU 选择
+        # 后处理时根据 multimask_output 和稳定性进行选择
+        # 这样可以保持固定输出形状，支持 RKNN 转换
         masks = torch.clamp(masks, -32.0, 32.0)
 
         return masks, iou_predictions
@@ -189,7 +194,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     input_size = (1024, 1024)
-    multimask_output = False
     model_type = args.model_type
     if model_type == "sam2.1_hiera_tiny":
         model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
@@ -222,9 +226,9 @@ if __name__ == "__main__":
     )
     print("Saved encoder to", args.output_encoder)
 
-    sam2_decoder = SAM2ImageDecoder(
-        sam2_model, multimask_output=multimask_output
-    ).cpu()
+    # 创建 decoder，输出所有 4 个 mask
+    # 后处理时再根据 multimask_output 和稳定性进行选择
+    sam2_decoder = SAM2ImageDecoder(sam2_model).cpu()
 
     embed_dim = sam2_model.sam_prompt_encoder.embed_dim
     embed_size = (
@@ -234,15 +238,19 @@ if __name__ == "__main__":
     mask_input_size = [4 * x for x in embed_size]
     print(embed_dim, embed_size, mask_input_size)
 
+    # 使用固定形状以支持 RKNN 转换
+    # 固定为 1 个 batch，1 个点
+    num_points = 1
     point_coords = torch.randint(
-        low=0, high=input_size[1], size=(1, 5, 2), dtype=torch.float
+        low=0, high=input_size[1], size=(1, num_points, 2), dtype=torch.float
     )
-    point_labels = torch.randint(low=0, high=1, size=(1, 5), dtype=torch.float)
+    point_labels = torch.randint(low=0, high=1, size=(1, num_points), dtype=torch.float)
     mask_input = torch.randn(1, 1, *mask_input_size, dtype=torch.float)
     has_mask_input = torch.tensor([1], dtype=torch.float)
-    orig_im_size = torch.tensor([input_size[0], input_size[1]], dtype=torch.int)
 
     pathlib.Path(args.output_decoder).parent.mkdir(parents=True, exist_ok=True)
+    # 导出固定形状的 decoder ONNX 模型（不使用 dynamic_axes）
+    # 这是为了支持 RKNN 转换，RKNN 对动态输出形状支持有限
     torch.onnx.export(
         sam2_decoder,
         (
@@ -251,7 +259,6 @@ if __name__ == "__main__":
             high_res_feats_1,
             point_coords,
             point_labels,
-            orig_im_size,
             mask_input,
             has_mask_input,
         ),
@@ -265,16 +272,11 @@ if __name__ == "__main__":
             "high_res_feats_1",
             "point_coords",
             "point_labels",
-            "orig_im_size",
             "mask_input",
             "has_mask_input",
         ],
         output_names=["masks", "iou_predictions"],
-        dynamic_axes={
-            "point_coords": {0: "num_labels", 1: "num_points"},
-            "point_labels": {0: "num_labels", 1: "num_points"},
-            "mask_input": {0: "num_labels"},
-            "has_mask_input": {0: "num_labels"},
-        },
+        # 注意：移除 dynamic_axes 以生成固定形状的模型，支持 RKNN 转换
+        # 如果需要动态输入，可以在 convert_rknn.py 中使用 dynamic_input 配置
     )
     print("Saved decoder to", args.output_decoder)
