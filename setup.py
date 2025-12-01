@@ -22,13 +22,14 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 # Required dependencies
 REQUIRED_PACKAGES = [
-    "torch>=2.3.1",
-    "torchvision>=0.18.1",
+    "torch==2.4.0",
+    "torchvision==0.19.0",
     "numpy>=1.24.4",
     "tqdm>=4.66.1",
     "hydra-core>=1.3.2",
     "iopath>=0.1.10",
     "pillow>=9.4.0",
+    "timm==1.0.15",
 ]
 
 EXTRA_PACKAGES = {
@@ -58,13 +59,11 @@ EXTRA_PACKAGES = {
         "opencv-python==4.10.0.84",
         "moviepy==1.0.3",
         "pydantic==2.10.6",
-        "timm==1.0.15",
         "eva-decord==0.6.1",
     ],
     "coreml": [
         "coremltools>=8.0.0",
         "pillow>=9.4.0",
-        "timm==1.0.15",  # Required for EdgeTAM model with RepViT backbone
     ],
 }
 
