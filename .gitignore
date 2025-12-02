@@ -13,3 +13,4 @@ checkpoints/*.pt
 RKNN_converter/*.onnx
 RKNN_converter/*.rknn
 RKNN_converter/*.png
+RKNN_converter/output*
