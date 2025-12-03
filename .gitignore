@@ -14,3 +14,5 @@ RKNN_converter/*.onnx
 RKNN_converter/*.rknn
 RKNN_converter/*.png
 RKNN_converter/output*
+RKNN_converter/calibration_data/*
+RKNN_converter/accuracy_analysis/*
