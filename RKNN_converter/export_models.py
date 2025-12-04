@@ -127,27 +127,14 @@ class SAM2ImageDecoder(nn.Module):
         sam_output_token = sam_output_tokens[:, 0]
         obj_ptr = self.obj_ptr_proj(sam_output_token)
         
-        # 遮挡处理
-        if self.pred_obj_scores:
-            is_obj_appearing = object_score_logits > 0
-            
-            # 关键：当物体不存在时，将 mask 设置为很大的负值
-            # 这样 sigmoid 后接近 0，即空 mask
-            NO_OBJ_SCORE = -1024.0
-            masks = torch.where(
-                is_obj_appearing[:, None, None, None],
-                masks,
-                torch.tensor(NO_OBJ_SCORE, device=masks.device, dtype=masks.dtype),
-            )
-            
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
-
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        # 注意: 遮挡处理 (object_score_logits 条件判断) 移到推理代码中执行
+        # RKNN 对 torch.where 的动态条件支持有问题，会导致条件被错误优化
+        # 因此我们在 ONNX 导出时不做这个处理，而是在推理时根据 object_score_logits 判断
+        #
+        # 物体指针的 no_obj_ptr 混合也移到推理代码中
+        # 原始逻辑:
+        #   if obj_score > 0: use obj_ptr
+        #   else: use no_obj_ptr (or mixed based on soft_no_obj_ptr)
 
         return masks, iou_predictions, obj_ptr, object_score_logits
 
@@ -194,17 +181,18 @@ class SAM2MemoryEncoder(nn.Module):
         self,
         pix_feat: torch.Tensor,  # [B, C, H, W] 视觉特征 (image_embed)
         pred_mask: torch.Tensor,  # [B, 1, H_mask, W_mask] 预测的 mask (高分辨率)
-        object_score_logits: torch.Tensor,  # [B, 1] 物体存在分数
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             pix_feat: [B, 256, 64, 64] 视觉特征
             pred_mask: [B, 1, 1024, 1024] 高分辨率 mask
-            object_score_logits: [B, 1] 物体存在分数
             
         Returns:
-            maskmem_features: [B, 64, 16, 16] 记忆特征 (经过 spatial perceiver)
-            maskmem_pos_enc: [B, 64, 16, 16] 位置编码
+            maskmem_features: [B, HW, C] 记忆特征 (经过 spatial perceiver)
+            maskmem_pos_enc: [B, HW, C] 位置编码
+            
+        注意: object_score_logits 相关的 no_obj_embed_spatial 逻辑
+        移到推理代码中处理，因为 RKNN 对动态条件支持有问题
         """
         # 应用 sigmoid 和缩放
         mask_for_mem = torch.sigmoid(pred_mask)
@@ -218,12 +206,11 @@ class SAM2MemoryEncoder(nn.Module):
         maskmem_features = maskmem_out["vision_features"]
         maskmem_pos_enc = maskmem_out["vision_pos_enc"][0]
         
-        # 添加 no-object embedding
-        if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
-            maskmem_features = maskmem_features + (
-                1 - is_obj_appearing[..., None, None]
-            ) * self.no_obj_embed_spatial[..., None, None].expand(*maskmem_features.shape)
+        # 注意: no-object embedding 的条件判断移到推理代码中
+        # RKNN 对 torch.where 和动态条件支持有问题
+        # 原始逻辑:
+        #   if obj_score > 0: use maskmem_features
+        #   else: maskmem_features += no_obj_embed_spatial
         
         # 空间感知器降维
         if self.spatial_perceiver is not None:
@@ -303,26 +290,25 @@ def export_onnx_models(sam2_model: SAM2Base, output_dir: pathlib.Path, model_typ
     print("\n[3/3] 导出 Memory Encoder...")
     sam2_mem_encoder = SAM2MemoryEncoder(sam2_model).cpu().eval()
     
-    # 准备输入
+    # 准备输入 (不再需要 object_score_logits)
     pix_feat = image_embed  # [1, 256, 64, 64]
     pred_mask_high_res = torch.randn(1, 1, 1024, 1024)  # 高分辨率 mask
-    object_score_logits = torch.tensor([[5.0]])  # 物体存在
     
     mem_encoder_path = output_dir / f"{model_type}_memory_encoder.onnx"
     torch.onnx.export(
         sam2_mem_encoder,
-        (pix_feat, pred_mask_high_res, object_score_logits),
+        (pix_feat, pred_mask_high_res),
         str(mem_encoder_path),
         export_params=True,
         opset_version=opset,
         do_constant_folding=True,
-        input_names=["pix_feat", "pred_mask", "object_score_logits"],
+        input_names=["pix_feat", "pred_mask"],
         output_names=["maskmem_features", "maskmem_pos_enc"],
     )
     print(f"  保存到: {mem_encoder_path}")
     
     # 测试输出
-    maskmem_features, maskmem_pos_enc = sam2_mem_encoder(pix_feat, pred_mask_high_res, object_score_logits)
+    maskmem_features, maskmem_pos_enc = sam2_mem_encoder(pix_feat, pred_mask_high_res)
     print(f"  输出形状: maskmem_features={maskmem_features.shape}, maskmem_pos_enc={maskmem_pos_enc.shape}")
     
     return encoder_path, decoder_path, mem_encoder_path
@@ -355,6 +341,21 @@ def export_memory_attention_pt(sam2_model: SAM2Base, output_dir: pathlib.Path):
     if hasattr(sam2_model, 'maskmem_tpos_enc'):
         extras['maskmem_tpos_enc'] = sam2_model.maskmem_tpos_enc.detach().cpu()
         print(f"  maskmem_tpos_enc: {extras['maskmem_tpos_enc'].shape}")
+    
+    # no_obj_embed_spatial: 当物体不存在时添加到记忆特征上
+    if hasattr(sam2_model, 'no_obj_embed_spatial') and sam2_model.no_obj_embed_spatial is not None:
+        extras['no_obj_embed_spatial'] = sam2_model.no_obj_embed_spatial.detach().cpu()
+        print(f"  no_obj_embed_spatial: {extras['no_obj_embed_spatial'].shape}")
+    
+    # no_obj_ptr: 当物体不存在时使用的物体指针
+    if hasattr(sam2_model, 'no_obj_ptr') and sam2_model.no_obj_ptr is not None:
+        extras['no_obj_ptr'] = sam2_model.no_obj_ptr.detach().cpu()
+        print(f"  no_obj_ptr: {extras['no_obj_ptr'].shape}")
+    
+    # soft_no_obj_ptr 和 fixed_no_obj_ptr 配置
+    extras['soft_no_obj_ptr'] = getattr(sam2_model, 'soft_no_obj_ptr', False)
+    extras['fixed_no_obj_ptr'] = getattr(sam2_model, 'fixed_no_obj_ptr', False)
+    extras['pred_obj_scores'] = getattr(sam2_model, 'pred_obj_scores', True)
     
     output_path = output_dir / "memory_attention.pt"
     torch.save({

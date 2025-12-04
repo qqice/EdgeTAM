@@ -25,8 +25,12 @@ import onnxslim
 
 
 def convert_to_rknn(onnx_model, model_part, output_rknn=None, 
-                    dataset="/home/qqice/Rockchip/rknn_model_zoo/datasets/COCO/coco_subset_20.txt", 
-                    quantize=False):
+                    dataset=None, 
+                    quantize=False,
+                    calibration_dir=None,
+                    target_platform='rk3576',
+                    use_float32=False,
+                    cpu_ops=None):
     """
     转换单个 ONNX 模型到 RKNN 格式
     
@@ -34,9 +38,28 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
         onnx_model: ONNX 模型路径
         model_part: 模型类型 ("encoder", "decoder", "memory_encoder")
         output_rknn: 输出 RKNN 文件路径，默认与 ONNX 同名
-        dataset: 量化校准数据集路径
+        dataset: 量化校准数据集路径 (直接指定)
         quantize: 是否启用量化
+        calibration_dir: 校准数据目录 (由 prepare_calibration_data.py 生成)
+        target_platform: 目标平台 (rk3576/rk3588，默认 rk3576)
+        use_float32: 使用 float32 而非 float16 (更慢但更精确)
+        cpu_ops: 强制在 CPU 执行的算子列表，如 ['Where', 'ScatterND']
     """
+    # 自动查找校准数据
+    if quantize and dataset is None and calibration_dir is not None:
+        calib_files = {
+            'encoder': 'encoder_calibration_npy.txt',
+            'decoder': 'decoder_calibration.txt',
+            'memory_encoder': 'memory_encoder_calibration.txt',
+        }
+        calib_file = os.path.join(calibration_dir, calib_files.get(model_part, ''))
+        if os.path.exists(calib_file):
+            dataset = calib_file
+            print(f"使用校准数据: {dataset}")
+        else:
+            print(f"警告: 未找到 {model_part} 的校准数据 {calib_file}")
+            print("将使用默认校准 (可能影响精度)")
+            dataset = None
     if output_rknn is None:
         output_rknn = onnx_model.replace(".onnx", ".rknn")
     timedate_iso = datetime.datetime.now().isoformat()
@@ -46,6 +69,9 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
     print(f"输出到: {output_rknn}")
     print(f"模型类型: {model_part}")
     print(f"量化: {quantize}")
+    print(f"精度: {'float32' if use_float32 else 'float16'}")
+    if cpu_ops:
+        print(f"CPU 算子: {cpu_ops}")
     print(f"{'='*60}")
 
     rknn = RKNN(verbose=True)
@@ -68,9 +94,26 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
     
     # Memory Encoder 中的 Spatial Perceiver 使用特殊的注意力模式，
     # 需要禁用某些优化规则来避免 RKNN 的 bug
+    # Decoder 也需要禁用 SDPA 融合，因为包含复杂的注意力运算
     disable_rules = []
     if model_part == "memory_encoder":
         disable_rules = ['fuse_matmul_softmax_matmul_to_sdpa']
+    elif model_part == "decoder":
+        # Decoder 包含 SAM 的 mask decoder 和 transformer，禁用可能有问题的优化
+        disable_rules = [
+            'fuse_matmul_softmax_matmul_to_sdpa',  # 禁用 SDPA 融合
+        ]
+    
+    # Decoder 使用较低的优化级别以避免精度问题
+    opt_level = 2 if model_part == "decoder" else 3
+    
+    # 配置浮点精度
+    float_dtype = 'float32' if use_float32 else 'float16'
+    
+    # 配置 CPU 执行的算子
+    op_target_config = None
+    if cpu_ops:
+        op_target_config = {op: 'cpu' for op in cpu_ops}
     
     rknn.config(
         dynamic_input=None,
@@ -81,17 +124,17 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
         quantized_algorithm='normal',
         quantized_method='channel',
         quantized_hybrid_level=0,
-        target_platform='rk3588',
+        target_platform=target_platform,
         quant_img_RGB2BGR=False,
-        float_dtype='float16',
-        optimization_level=3,
+        float_dtype=float_dtype,
+        optimization_level=opt_level,
         custom_string=f"EdgeTAM {model_part}, converted at {timedate_iso}",
         remove_weight=False,
         compress_weight=False,
         inputs_yuv_fmt=None,
         single_core_mode=False,
         model_pruning=False,
-        op_target=None,
+        op_target=op_target_config,
         quantize_weight=False,
         remove_reshape=False,
         sparse_infer=False,
@@ -118,7 +161,9 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
     return True
 
 
-def convert_with_slim(onnx_model, model_part, output_rknn=None, quantize=False):
+def convert_with_slim(onnx_model, model_part, output_rknn=None, quantize=False, 
+                      calibration_dir=None, target_platform='rk3576',
+                      use_float32=False, cpu_ops=None):
     """
     先用 onnxslim 优化 ONNX 模型，然后转换为 RKNN
     
@@ -136,10 +181,16 @@ def convert_with_slim(onnx_model, model_part, output_rknn=None, quantize=False):
     except Exception as e:
         print(f"警告: onnxslim 优化失败: {e}")
         print("尝试直接转换...")
-        return convert_to_rknn(onnx_model, model_part, output_rknn, quantize=quantize)
+        return convert_to_rknn(onnx_model, model_part, output_rknn, 
+                               quantize=quantize, calibration_dir=calibration_dir,
+                               target_platform=target_platform,
+                               use_float32=use_float32, cpu_ops=cpu_ops)
     
     # 转换优化后的模型
-    success = convert_to_rknn(slim_onnx, model_part, output_rknn, quantize=quantize)
+    success = convert_to_rknn(slim_onnx, model_part, output_rknn, 
+                              quantize=quantize, calibration_dir=calibration_dir,
+                              target_platform=target_platform,
+                              use_float32=use_float32, cpu_ops=cpu_ops)
     
     # 清理临时文件
     if os.path.exists(slim_onnx):
@@ -160,6 +211,8 @@ def main():
   python convert_rknn.py edgetam --only decoder       # 只转换 decoder
   python convert_rknn.py edgetam --only memory_encoder # 只转换 memory_encoder
   python convert_rknn.py edgetam --quantize           # 启用量化
+  python convert_rknn.py edgetam --only decoder --float32  # decoder 使用 float32 提高精度
+  python convert_rknn.py edgetam --cpu-ops Where,ScatterND # 指定算子在 CPU 执行
 
 模型输入输出:
   encoder:
@@ -199,9 +252,30 @@ def main():
                         help='只转换指定的模型')
     parser.add_argument('--quantize', action='store_true',
                         help='启用 INT8 量化')
+    parser.add_argument('--calibration_dir', type=str, default=None,
+                        help='校准数据目录 (由 prepare_calibration_data.py 生成)')
+    parser.add_argument('--target', type=str, default='rk3576',
+                        choices=['rk3576', 'rk3588'],
+                        help='目标平台 (默认: rk3576)')
     parser.add_argument('--no-slim', action='store_true',
                         help='跳过 onnxslim 优化步骤')
+    parser.add_argument('--float32', action='store_true',
+                        help='使用 float32 精度 (更慢但更精确，推荐 decoder 使用)')
+    parser.add_argument('--cpu-ops', type=str, default=None,
+                        help='强制在 CPU 执行的算子，逗号分隔，如 "Where,ScatterND"')
     args = parser.parse_args()
+    
+    # 解析 CPU 算子列表
+    cpu_ops = None
+    if args.cpu_ops:
+        cpu_ops = [op.strip() for op in args.cpu_ops.split(',')]
+        print(f"将以下算子强制在 CPU 执行: {cpu_ops}")
+    
+    # 检查量化配置
+    if args.quantize and args.calibration_dir is None:
+        print("警告: 启用量化但未指定校准数据目录")
+        print("建议先运行: python prepare_calibration_data.py --image_dir <图像目录>")
+        print("然后使用: python convert_rknn.py edgetam --quantize --calibration_dir calibration_data")
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -250,9 +324,19 @@ def main():
         print(f"{'#'*60}")
         
         if need_slim:
-            success = convert_with_slim(onnx_path, model_part, rknn_path, quantize=args.quantize)
+            success = convert_with_slim(onnx_path, model_part, rknn_path, 
+                                        quantize=args.quantize, 
+                                        calibration_dir=args.calibration_dir,
+                                        target_platform=args.target,
+                                        use_float32=args.float32,
+                                        cpu_ops=cpu_ops)
         else:
-            success = convert_to_rknn(onnx_path, model_part, rknn_path, quantize=args.quantize)
+            success = convert_to_rknn(onnx_path, model_part, rknn_path, 
+                                      quantize=args.quantize,
+                                      calibration_dir=args.calibration_dir,
+                                      target_platform=args.target,
+                                      use_float32=args.float32,
+                                      cpu_ops=cpu_ops)
         
         results[model_part] = success
     
