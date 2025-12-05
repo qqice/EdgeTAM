@@ -17,15 +17,20 @@ ONNX 到 RKNN 简单转换脚本 (无优化)
 import os
 import sys
 import argparse
+import importlib.metadata
 from pathlib import Path
 
-# 检查 RKNN Toolkit 是否可用
+# 检查 RKNN Toolkit 是否可用并打印包版本（避免调用 runtime 相关 API）
 try:
     from rknn.api import RKNN
-    print(f"RKNN Toolkit 版本: {RKNN().get_sdk_version()}")
+    try:
+        pkg_version = importlib.metadata.version("rknn-toolkit2")
+        print("rknn-toolkit2 package version: {}".format(pkg_version))
+    except importlib.metadata.PackageNotFoundError:
+        print("rknn-toolkit2 package version: unknown (module imported)")
 except ImportError:
-    print("错误: 未找到 rknn-toolkit2")
-    print("请在 x86 服务器上安装: pip install rknn-toolkit2")
+    print("Error: rknn-toolkit2 not found")
+    print("Install on x86 server: pip install rknn-toolkit2")
     sys.exit(1)
 
 
@@ -34,6 +39,7 @@ def convert_model(
     rknn_path: str,
     target_platform: str = "rk3576",
     use_float32: bool = True,
+    use_bfloat16: bool = False,
     opt_level: int = 0,
     mean_values: list = None,
     std_values: list = None,
@@ -75,13 +81,16 @@ def convert_model(
         'disable_rules': disable_rules,
     }
     
-    # 设置精度
+    # 设置精度：RKNN 支持 float16 / bfloat16 / tfloat32（无原生 float32）
     if use_float32:
-        config_params['float_dtype'] = 'float32'
-        print(f"  精度: float32")
+        config_params['float_dtype'] = 'tfloat32'
+        print("  精度: tfloat32 (近似 float32)")
+    elif use_bfloat16:
+        config_params['float_dtype'] = 'bfloat16'
+        print("  精度: bfloat16")
     else:
         config_params['float_dtype'] = 'float16'
-        print(f"  精度: float16")
+        print("  精度: float16")
     
     print(f"  目标平台: {target_platform}")
     print(f"  优化级别: {opt_level}")
@@ -143,12 +152,17 @@ def main():
                         help="ONNX 模型目录")
     parser.add_argument("--output_dir", type=str, default="./rknn_models/no_opt",
                         help="输出 RKNN 模型目录")
-    parser.add_argument("--target", type=str, default="rk3576",
+    parser.add_argument("--target", type=str, default="rk3588",
                         help="目标平台: rk3576, rk3588, rk3568, etc.")
-    parser.add_argument("--float32", action="store_true", default=True,
-                        help="使用 float32 (默认)")
-    parser.add_argument("--float16", action="store_true",
-                        help="使用 float16")
+
+    # 精度选项（互斥），默认使用 float16 以保证兼容
+    precision_group = parser.add_mutually_exclusive_group()
+    precision_group.add_argument("--float16", action="store_true",
+                                 help="使用 float16 (默认)")
+    precision_group.add_argument("--float32", action="store_true",
+                                 help="使用 tfloat32，如果平台支持")
+    precision_group.add_argument("--bfloat16", action="store_true",
+                                 help="使用 bfloat16，如果平台支持")
     parser.add_argument("--opt_level", type=int, default=0, choices=[0, 1, 2, 3],
                         help="优化级别: 0=无优化(默认), 1=基础, 2=中等, 3=最大")
     parser.add_argument("--encoder_only", action="store_true",
@@ -161,7 +175,8 @@ def main():
     args = parser.parse_args()
     
     # 确定精度
-    use_float32 = not args.float16
+    use_float32 = args.float32
+    use_bfloat16 = args.bfloat16
     
     print("=" * 60)
     print("ONNX 到 RKNN 转换 (无优化版本)")
@@ -169,7 +184,12 @@ def main():
     print(f"\nONNX 目录: {args.onnx_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"目标平台: {args.target}")
-    print(f"精度: {'float32' if use_float32 else 'float16'}")
+    if use_float32:
+        print("精度: tfloat32")
+    elif use_bfloat16:
+        print("精度: bfloat16")
+    else:
+        print("精度: float16")
     print(f"优化级别: {args.opt_level}")
     
     # 创建输出目录
@@ -227,6 +247,7 @@ def main():
             rknn_path=rknn_path,
             target_platform=args.target,
             use_float32=use_float32,
+            use_bfloat16=use_bfloat16,
             opt_level=args.opt_level,
             mean_values=model['mean'],
             std_values=model['std'],

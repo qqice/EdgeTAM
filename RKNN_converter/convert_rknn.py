@@ -28,7 +28,7 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
                     dataset=None, 
                     quantize=False,
                     calibration_dir=None,
-                    target_platform='rk3576',
+                    target_platform='rk3588',
                     use_float32=False,
                     cpu_ops=None):
     """
@@ -162,7 +162,7 @@ def convert_to_rknn(onnx_model, model_part, output_rknn=None,
 
 
 def convert_with_slim(onnx_model, model_part, output_rknn=None, quantize=False, 
-                      calibration_dir=None, target_platform='rk3576',
+                      calibration_dir=None, target_platform='rk3588',
                       use_float32=False, cpu_ops=None):
     """
     先用 onnxslim 优化 ONNX 模型，然后转换为 RKNN
@@ -254,9 +254,9 @@ def main():
                         help='启用 INT8 量化')
     parser.add_argument('--calibration_dir', type=str, default=None,
                         help='校准数据目录 (由 prepare_calibration_data.py 生成)')
-    parser.add_argument('--target', type=str, default='rk3576',
+    parser.add_argument('--target', type=str, default='rk3588',
                         choices=['rk3576', 'rk3588'],
-                        help='目标平台 (默认: rk3576)')
+                        help='目标平台 (默认: rk3588)')
     parser.add_argument('--no-slim', action='store_true',
                         help='跳过 onnxslim 优化步骤')
     parser.add_argument('--float32', action='store_true',
