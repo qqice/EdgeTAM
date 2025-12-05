@@ -1079,6 +1079,15 @@ def inference_single_frame(
     return mask, vis
 
 
+def release_global_engine():
+    """释放全局引擎资源并清空缓存。"""
+    global _global_engine, _global_engine_config
+    if _global_engine is not None:
+        _global_engine.release()
+    _global_engine = None
+    _global_engine_config = None
+
+
 def find_mask_center(mask: np.ndarray) -> Optional[Tuple[int, int]]:
     if mask.ndim > 2:
         mask = mask.squeeze()
