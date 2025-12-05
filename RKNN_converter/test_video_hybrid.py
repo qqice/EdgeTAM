@@ -67,6 +67,23 @@ except ImportError:
 from memory_attention_standalone import build_memory_attention
 
 
+# ==================== 全局可变状态（用于实时/交互式调用） ====================
+
+# 是否允许基于当前 include point 进行推理
+allow_inference: bool = False
+
+# 当前 include point（x, y），仅在 allow_inference 为 True 时有效
+_current_point: Optional[Tuple[int, int]] = None
+
+# 混合推理引擎及其配置缓存
+_global_engine: Optional["HybridVideoInference"] = None
+_global_engine_config: Optional[Dict[str, str]] = None
+
+# 连续帧计数与上一帧的 mask，用于增量推理
+_global_frame_idx: int = 0
+_prev_mask: Optional[np.ndarray] = None
+
+
 # ==================== 常量 ====================
 
 IMG_SIZE = 1024
@@ -916,6 +933,150 @@ def load_frame_dir(dir_path: str) -> Tuple[List[Image.Image], List[str]]:
         frame_names.append(os.path.splitext(f)[0])
     
     return frames, frame_names
+
+
+# ==================== 实时/交互式封装函数 ====================
+
+def _validate_point(point: Tuple[int, int], frame_shape: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+    """校验输入点，确保为非负整数，必要时检查是否在帧内。"""
+    if (not isinstance(point, tuple)) or len(point) != 2:
+        raise ValueError("point 必须是长度为 2 的元组 (x, y)")
+    x, y = point
+    if not (isinstance(x, int) and isinstance(y, int)):
+        raise ValueError("point 的 x/y 必须是整数")
+    if x < 0 or y < 0:
+        raise ValueError("point 的 x/y 不能为负")
+    if frame_shape is not None:
+        h, w = frame_shape
+        if x >= w or y >= h:
+            raise ValueError(f"point 超出图像范围: ({x}, {y}) 不在 [0,{w})x[0,{h})")
+    return x, y
+
+
+def _ensure_engine(
+    onnx_dir: str = 'onnx_models',
+    rknn_dir: Optional[str] = None,
+    encoder: str = 'rknn',
+    decoder: str = 'onnx',
+    memory_encoder: str = 'onnx',
+    device: str = 'cpu',
+) -> HybridVideoInference:
+    """懒加载/复用混合推理引擎，避免重复初始化。"""
+    global _global_engine, _global_engine_config
+    cfg = {
+        'onnx_dir': onnx_dir,
+        'rknn_dir': rknn_dir,
+        'encoder': encoder,
+        'decoder': decoder,
+        'memory_encoder': memory_encoder,
+        'device': device,
+    }
+    if _global_engine is None or _global_engine_config != cfg:
+        if _global_engine is not None:
+            _global_engine.release()
+        _global_engine = HybridVideoInference(
+            onnx_dir=onnx_dir,
+            rknn_dir=rknn_dir,
+            encoder_backend=encoder,
+            decoder_backend=decoder,
+            memory_encoder_backend=memory_encoder,
+            device=device,
+        )
+        _global_engine_config = cfg
+    return _global_engine
+
+
+def reset_inference():
+    """重置推理状态并关闭允许标记。"""
+    global allow_inference, _global_frame_idx, _prev_mask, _current_point
+    if _global_engine is not None:
+        _global_engine.reset()
+    _global_frame_idx = 0
+    _prev_mask = None
+    _current_point = None
+    allow_inference = False
+
+
+def set_include_point(point: Tuple[int, int]):
+    """设置 include point 并开启推理开关。"""
+    global allow_inference, _current_point
+    _validate_point(point)
+    reset_inference()  # 重置状态以避免旧记忆影响新点
+    _current_point = point
+    allow_inference = True
+
+
+def inference_single_frame(
+    frame_bgr: np.ndarray,
+    *,
+    onnx_dir: str = 'onnx_models',
+    rknn_dir: Optional[str] = None,
+    encoder: str = 'rknn',
+    decoder: str = 'onnx',
+    memory_encoder: str = 'onnx',
+    device: str = 'cpu',
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    """
+    对单帧执行推理：
+      - allow_inference=True 时，返回 (mask, 可视化 BGR 图像)
+      - allow_inference=False 时，返回 (None, 原始帧)
+    输入帧应为 OpenCV BGR 格式的 np.ndarray。
+    """
+    global allow_inference, _global_frame_idx, _prev_mask
+    if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.ndim != 3:
+        raise ValueError("frame_bgr 必须是形状为 HxWx3 的 np.ndarray (BGR)")
+    h, w, c = frame_bgr.shape
+    if c != 3:
+        raise ValueError("frame_bgr 必须有 3 个通道 (BGR)")
+
+    if not allow_inference:
+        # 未允许推理时直接回传原图
+        return None, frame_bgr
+
+    if _current_point is None:
+        raise ValueError("尚未设置 include point，先调用 set_include_point")
+
+    # 点位校验（在当前帧尺寸下）
+    point = _validate_point(_current_point, frame_shape=(h, w))
+
+    engine = _ensure_engine(
+        onnx_dir=onnx_dir,
+        rknn_dir=rknn_dir,
+        encoder=encoder,
+        decoder=decoder,
+        memory_encoder=memory_encoder,
+        device=device,
+    )
+
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    frame_pil = Image.fromarray(frame_rgb)
+
+    is_cond_frame = (_global_frame_idx == 0)
+    mask, iou, obj_score, timings = engine.process_frame(
+        frame_pil,
+        _global_frame_idx,
+        point,
+        prev_mask=_prev_mask,
+        is_cond_frame=is_cond_frame,
+    )
+
+    _prev_mask = mask
+    _global_frame_idx += 1
+
+    vis = create_visualization(
+        frame_pil,
+        mask,
+        point,
+        _global_frame_idx - 1,
+        iou,
+        obj_score,
+        timings,
+        engine.get_config(),
+        color=(0.2, 0.6, 1.0),
+        alpha=0.5,
+    )
+
+    return mask, vis
 
 
 def find_mask_center(mask: np.ndarray) -> Optional[Tuple[int, int]]:
